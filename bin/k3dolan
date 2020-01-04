@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_err() {
+  >&2 echo "err: $*"
+  exit 1
+}
+
+command="${1:-}"
+clusterCommand=0
+case "$command" in
+  list)
+    k3d list
+  ;;
+  version)
+    echo "0.1.0"
+  ;;
+  ""|usage|help)
+    echo 'USAGE: k3dolan COMMAND [ARGS]
+list
+  lists all k3s containers
+
+create NAME
+  creates a k3s container and fetches the kubeconfig
+
+delete NAME
+  deletes a k3s container
+
+kubeconfig NAME
+  returns the path to the kubeconfig. use with: export KUBECONFIG=$(k3dolan kubeconfig NAME)
+
+proxy:enable NAME [--publish=127.0.0.1:80:80 --publish=127.0.0.1:443:443]
+  publishes ports from the container to the host
+
+proxy:disable NAME
+  disables the proxy
+
+proxy:show NAME
+  shows the current proxy if enabled
+
+ip NAME
+  returns the IP address of the container
+
+stats NAME
+  shows docker stats for the container
+
+kubectl|k NAME <kubectl args>
+  runs kubectl with correct kubeconfig
+
+helm NAME <helm args>
+  runs helm with correct kubeconfig
+
+version|--version
+usage|help
+'
+  ;;
+  *)
+    clusterCommand=1
+  ;;
+esac
+
+[ "$clusterCommand" = 0 ] && exit 0
+
+name="${2:-}"
+[ "$name" = "" ] && _err "name missing"
+
+KUBECONFIG="$HOME/.config/k3d/$name/kubeconfig.yaml"
+
+case "$command" in
+  create)
+    while
+      port=$(shuf -n 1 -i 49152-65535)
+      netstat -atun | grep -q "$port"
+    do
+      continue
+    done
+
+    k3d create --name "$name" --api-port $port
+
+    while true; do
+      >/dev/null 2>&1 k3d get-kubeconfig --name="$name" && break
+      echo "waiting for kubeconfig..."
+      sleep 1
+    done
+
+    echo """
+
+k3dolan done! now run
+
+    export KUBECONFIG=\$(k3dolan kubeconfig $name)
+
+"""
+  ;;
+  delete)
+    $0 proxy:disable "$name"
+    k3d delete --name "$name"
+  ;;
+  ip)
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "k3d-$name-server"
+  ;;
+  proxy:enable)
+    >/dev/null 2>&1 $0 proxy:disable "$name"
+
+    serverIp=$($0 ip $name)
+
+    defaultPublish="--publish 127.0.0.1:80:80 --publish 127.0.0.1:443:443"
+    publish=""
+    for arg in "${@:3}"; do
+      case $arg in
+        --publish=*)
+          publish="$publish$arg "
+        ;;
+      esac
+    done
+    [ "$publish" = "" ] && publish="$defaultPublish"
+
+    >/dev/null docker run -d --name "k3dolanproxy-$name" \
+      --network "k3d-$name" \
+      $publish \
+      alpine/socat -dd \
+      tcp-listen:80,fork,reuseaddr tcp-connect:$serverIp:80
+
+    echo "proxy to k3d-$name-server enabled with $publish"
+  ;;
+  proxy:disable)
+    disabled=false
+    >/dev/null 2>&1 docker rm -f "k3dolanproxy-$name" && disabled=true
+
+    if [ "$disabled" = true ]; then
+      echo "proxy disabled"
+    else
+      echo "proxy is not running"
+    fi
+  ;;
+  proxy:show)
+    docker ps -f name=k3dolanproxy-$name
+  ;;
+  kubectl|k)
+    kubectl "${@:3}"
+  ;;
+  helm)
+    helm "${@:3}"
+  ;;
+  kubeconfig)
+    echo $KUBECONFIG
+  ;;
+  stats)
+    docker stats "k3d-$name-server"
+  ;;
+  *)
+    $0 usage
+    exit
+  ;;
+esac
